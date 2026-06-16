@@ -1,0 +1,9 @@
+transformers>=4.40
+peft>=0.11
+datasets
+torch
+numpy
+pandas
+scipy
+statsmodels
+matplotlib

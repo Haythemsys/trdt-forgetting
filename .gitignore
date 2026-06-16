@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.ckpt
+.DS_Store
+# generated outputs (regenerate with: python trdt_kaggle.py --stage paper)
+*.csv
