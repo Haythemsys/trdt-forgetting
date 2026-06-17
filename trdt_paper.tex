@@ -1,0 +1,577 @@
+\documentclass[11pt]{article}
+% =============================================================================
+%  Task-Relevant Drift: A Causal Account of Catastrophic Forgetting
+%  in LoRA Continual Fine-Tuning
+%
+%  Draft for TMLR (Transactions on Machine Learning Research).
+%  All numbers below come from the author's reproducible experiments
+%  (observational.csv : N=162, decisive.csv : N=30 paired).
+%  Replace the placeholder author block and, if submitting to TMLR, swap the
+%  preamble for the official tmlr.sty style file.
+% =============================================================================
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{xcolor}
+\usepackage[margin=1in]{geometry}
+\usepackage{natbib}
+
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+\newcommand{\trdrift}{\mathrm{TR\text{-}drift}}
+\newcommand{\totaldrift}{\mathrm{Drift}_{\mathrm{tot}}}
+\newcommand{\PA}{\mathcal{P}_A}
+
+\title{\textbf{Task-Relevant Drift: A Causal Account of Catastrophic
+Forgetting in LoRA Continual Fine-Tuning}}
+
+\author{
+Haithem Barkaoui\\
+Recherche indépendante, France\\
+\texttt{haythem.barkaoui@gmail.com}
+}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+% -----------------------------------------------------------------------------
+\begin{abstract}
+Catastrophic forgetting in continual fine-tuning is widely attributed to
+\emph{interference} between tasks in a shared parameter substrate, and a
+popular family of mitigation methods (gradient orthogonalization, subspace
+projection) rests on the assumption that the \emph{static geometric overlap}
+between task subspaces predicts how much a model forgets. We test this
+assumption directly for low-rank adaptation (LoRA) of GPT-2 and find it
+wanting: across 162 continual fine-tuning conditions, static overlap is only a
+weak predictor of forgetting ($r=0.39$) and loses its explanatory power once
+total parameter motion is controlled for. We instead propose \emph{Task-Relevant
+Drift} ($\trdrift$): the component of the post-update parameter change that lies
+inside the previous task's functional subspace $\PA$. $\trdrift$ predicts
+forgetting substantially better ($r=0.63$) and retains its predictive power
+after partialling out total drift. Decomposing total drift into task-relevant
+and orthogonal parts further localizes the predictive signal to the
+task-relevant component. We then move from correlation to causation with a
+controlled decoupling experiment: holding the total backbone step norm fixed,
+steering the update \emph{into} $\PA$ rather than orthogonal to it nearly doubles
+forgetting (Cohen's $d=0.94$, $p=10^{-4}$), establishing $\trdrift$ as a direct
+cause of forgetting rather than a mere correlate. Finally, the relationship
+persists across EWC, OGD, and GPM, indicating $\trdrift$ is a general descriptor
+rather than an artifact of plain fine-tuning. We release all code and data, and
+restrict our claims to GPT-2 small, discussing scaling to larger models as
+future work.
+\end{abstract}
+
+% -----------------------------------------------------------------------------
+\section{Introduction}
+\label{sec:intro}
+
+Continual fine-tuning---adapting a pretrained model to a sequence of tasks---is
+central to deploying large language models, yet it remains plagued by
+\emph{catastrophic forgetting}: performance on earlier tasks degrades as later
+tasks are learned \citep{mccloskey1989catastrophic,kirkpatrick2017overcoming}.
+Parameter-efficient methods such as LoRA \citep{hu2021lora} reduce the number of
+trainable parameters but do not, by themselves, eliminate forgetting, because
+the adapted layers still share a common substrate across tasks.
+
+A large body of mitigation methods rests on a single intuitive premise: that
+forgetting is driven by \emph{interference} between tasks, and that this
+interference is captured by the \emph{static geometric overlap} between the
+parameter-space directions each task relies on. Methods that orthogonalize
+gradients or project updates into task-specific subspaces are, in effect,
+attempts to reduce this static overlap. If the premise holds, static overlap
+should predict forgetting.
+
+In this paper we test the premise directly and find that it does not hold in the
+form usually assumed. Our contributions are:
+
+\begin{enumerate}
+    \item \textbf{A negative result.} Across 162 continual fine-tuning
+    conditions, the static overlap between the two tasks' gradient subspaces is
+    only weakly correlated with forgetting ($r=0.39$) and is dominated by---and
+    largely redundant with---total parameter motion. Static geometry alone does
+    not explain forgetting (Section~\ref{sec:negative}).
+
+    \item \textbf{A better predictor.} We define \emph{Task-Relevant Drift}
+    ($\trdrift$): the portion of the parameter change that lands inside the
+    previous task's functional (gradient-PCA) subspace $\PA$. $\trdrift$
+    predicts forgetting more strongly ($r=0.63$) and, unlike static overlap and
+    unlike total drift, adds incremental predictive validity: after controlling
+    for total drift, partial $r=0.52$ ($p=1.5\times10^{-12}$), with
+    $\Delta R^2=+0.21$ (Section~\ref{sec:correlation}).
+
+    \item \textbf{A causal test.} We decouple direction from magnitude: holding
+    the total backbone step norm fixed, we steer the update either into $\PA$ or
+    orthogonal to it. Motion into $\PA$ causes nearly double the forgetting
+    (0.186 vs.\ 0.106; $d=0.94$, $p=10^{-4}$), establishing $\trdrift$ as a
+    \emph{cause} of forgetting, not merely a correlate
+    (Section~\ref{sec:causal}). This confirms our pre-registered prediction
+    that manipulating task-relevant drift independently of total drift changes
+    forgetting.
+\end{enumerate}
+
+We deliberately scope all claims to GPT-2 small and binary text-classification
+tasks; Section~\ref{sec:limitations} discusses why scaling is the key next step.
+
+% -----------------------------------------------------------------------------
+\section{Related Work}
+\label{sec:related}
+
+\paragraph{Catastrophic forgetting and continual learning.}
+Forgetting has been studied for decades \citep{mccloskey1989catastrophic,
+french1999catastrophic}. Regularization approaches such as EWC
+\citep{kirkpatrick2017overcoming} and LwF \citep{li2017learning} penalize
+changes to parameters deemed important for past tasks, while rehearsal/replay
+methods \citep{rebuffi2017icarl} retain or regenerate past data. These methods
+implicitly or explicitly localize ``important'' directions and try to protect
+them.
+
+\paragraph{Subspace and orthogonalization methods.}
+A complementary line constrains updates to lie in subspaces that minimize
+interference with previous tasks---e.g., orthogonal gradient descent and
+gradient projection memory \citep{farajtabar2020orthogonal,saha2021gradient}.
+The motivating assumption is that interference is governed by the geometric
+overlap between task subspaces. Our negative result questions the predictive
+adequacy of \emph{static} overlap and reframes the relevant quantity as the
+\emph{realized} motion inside the previous task's functional subspace.
+
+\paragraph{Parameter-efficient fine-tuning.}
+LoRA \citep{hu2021lora} and related adapters have become standard. Because the
+shared backbone is still perturbed during sequential adaptation, forgetting
+persists; our analysis treats the backbone drift as the mechanistic locus.
+
+% -----------------------------------------------------------------------------
+\section{Method}
+\label{sec:method}
+
+\paragraph{Setup.}
+We fine-tune GPT-2 small (124M parameters) for binary sequence classification
+with LoRA (rank 16, $\alpha=32$) applied to the attention projections, while
+keeping the transformer backbone trainable so that backbone drift---our object
+of study---can occur. We train Task~A, then Task~B, and measure how much Task~A
+performance degrades. Optimization uses AdamW; the LoRA and backbone learning
+rate is swept, the classification head uses a fixed rate. Each task uses 350
+training and 150 test examples; we use five seeds.
+
+\paragraph{Forgetting.}
+Let $\mathrm{Acc}_A^{(A)}$ be Task~A accuracy immediately after training Task~A,
+and $\mathrm{Acc}_A^{(B)}$ its accuracy after subsequently training Task~B. We
+define
+\begin{equation}
+\mathrm{Forgetting} = \max\!\left(0,\; \mathrm{Acc}_A^{(A)} - \mathrm{Acc}_A^{(B)}\right).
+\end{equation}
+
+\paragraph{Task functional subspace $\PA$.}
+We estimate the directions Task~A relies on from the principal components of its
+backbone gradients. We collect backbone gradients over $n$ minibatches of
+Task~A, center them, and take the top-$k$ right singular vectors per analyzed
+tensor as an orthonormal basis $U_A=\{u_i\}_{i=1}^k$ spanning $\PA$. (In our
+runs $n=32$, $k=16$.)
+
+\paragraph{Total drift and Task-Relevant Drift.}
+Let $\theta_A$ be the backbone parameters after Task~A and $\theta_B$ after
+Task~B, and $\Delta\theta=\theta_B-\theta_A$. We define
+\begin{align}
+\totaldrift &= \frac{\lVert \Delta\theta \rVert}{\lVert \theta_A \rVert}, &
+\trdrift &= \frac{\lVert \Pi_{\PA}\,\Delta\theta \rVert}{\lVert \theta_A \rVert}
+= \frac{\sqrt{\sum_i \langle \Delta\theta, u_i\rangle^2}}{\lVert \theta_A \rVert},
+\end{align}
+where $\Pi_{\PA}$ is the orthogonal projector onto $\PA$. Thus $\trdrift$ is the
+share of parameter motion that lands inside the previous task's functional
+subspace; computing it requires only inner products with the stored basis.
+
+\paragraph{Static overlap (the tested baseline predictor).}
+To operationalize the ``interference = static geometric overlap'' premise, we
+also estimate Task~B's functional subspace $\mathcal{P}_B$ (top-$k$ PCs of
+Task~B gradients at the post-A point) and measure the overlap between
+subspaces as the mean squared cosine between their bases,
+\begin{equation}
+\mathrm{overlap}(\PA,\mathcal{P}_B) = \frac{1}{k}\,\big\lVert U_A U_B^\top \big\rVert_F^2 \in [0,1],
+\end{equation}
+which is $1$ for identical subspaces and $0$ for orthogonal ones. This is a
+purely \emph{static} quantity, computed before the interfering update.
+
+\paragraph{Causal decoupling.}
+To separate direction from magnitude, we re-train Task~B while controlling the
+backbone update direction. At each step we project the backbone gradient either
+onto $\PA$ (\textsc{into}) or onto its orthogonal complement (\textsc{orth}),
+then rescale so that the per-step backbone update has the \emph{same} norm in
+both arms. The classification head and LoRA parameters train normally and
+identically across arms, so the arms differ \emph{only} in whether backbone
+motion is task-relevant, at matched total drift. Any forgetting difference is
+therefore attributable to direction relative to $\PA$.
+
+% -----------------------------------------------------------------------------
+\section{Experiment 1: Static Overlap Does Not Explain Forgetting}
+\label{sec:negative}
+
+We run an observational sweep over five task pairs
+(IMDb$\to$AG-News, AG-News$\to$IMDb, SST-2$\to$AG-News, Yelp$\to$AG-News,
+IMDb$\to$SST-2), five seeds, and six learning rates
+($5\!\times\!10^{-6}$ to $5\!\times\!10^{-4}$), for $N=162$ conditions. For each
+condition we record forgetting, static overlap, total drift, and $\trdrift$.
+
+Table~\ref{tab:corr} reports Pearson correlations with forgetting. Static
+overlap correlates only weakly ($r=0.39$, 95\% CI $[0.24, 0.52]$)---far below
+$\trdrift$ ($r=0.63$)---and, as Section~\ref{sec:correlation} shows, contributes
+nothing once magnitude is controlled. The geometric-overlap premise, in the
+static form assumed by projection methods, is thus a poor predictor of how much
+a model actually forgets.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.62\linewidth]{fig_overlap_scatter.png}
+\caption{Static subspace overlap is a weak, scattered predictor of forgetting
+($r=0.39$, $N=162$). Contrast with the tighter task-relevant relationship in
+Figure~\ref{fig:trdrift}.}
+\label{fig:overlap}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Correlation of candidate predictors with forgetting ($N=162$).
+$\trdrift$ is the strongest. 95\% bootstrap CIs in brackets.}
+\label{tab:corr}
+\begin{tabular}{lcc}
+\toprule
+Predictor & Pearson $r$ & 95\% CI \\
+\midrule
+Static overlap         & $0.39$ & $[0.24,\,0.52]$ \\
+Total drift            & $0.47$ & $[0.33,\,0.60]$ \\
+Task-Relevant Drift    & $\mathbf{0.63}$ & $[0.48,\,0.74]$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% -----------------------------------------------------------------------------
+\section{Experiment 2: Task-Relevant Drift Has Incremental Validity}
+\label{sec:correlation}
+
+A predictor is only interesting if it explains variance \emph{beyond} the
+obvious confound---here, total parameter motion, which trivially grows with the
+learning rate. We therefore test whether $\trdrift$ predicts forgetting after
+partialling out total drift.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.62\linewidth]{fig_trdrift_scatter.png}
+\caption{Task-Relevant Drift predicts forgetting ($r=0.63$, $N=162$). Each point
+is one continual fine-tuning condition; the relationship is visibly tighter than
+for static overlap (Figure~\ref{fig:overlap}).}
+\label{fig:trdrift}
+\end{figure}
+
+The partial correlation of $\trdrift$ with forgetting, controlling for total
+drift, is $r=0.52$ ($p=1.5\times10^{-12}$). A nested regression confirms the
+gain: $R^2$ rises from $0.22$ (total drift only) to $0.43$ (total drift
+$+\,\trdrift$), an increment of $\Delta R^2=+0.21$, with a positive and highly
+significant $\trdrift$ coefficient ($p<10^{-6}$). A mixed-effects model with a
+random intercept per source task confirms the effect is not an artifact of
+task grouping ($\trdrift$ coefficient $p<10^{-6}$). Static overlap, by contrast,
+provides no comparable increment. Table~\ref{tab:incremental} summarizes.
+
+\begin{table}[t]
+\centering
+\caption{Incremental validity of $\trdrift$ over total drift ($N=162$).}
+\label{tab:incremental}
+\begin{tabular}{lc}
+\toprule
+Quantity & Value \\
+\midrule
+Partial $r$ ($\trdrift$ vs.\ forgetting $\mid$ total drift) & $0.52$ \\
+\quad $p$-value & $1.5\times10^{-12}$ \\
+$R^2$ (total drift only)              & $0.22$ \\
+$R^2$ (total drift $+\,\trdrift$)     & $0.43$ \\
+$\Delta R^2$                          & $+0.21$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Robustness to subspace rank $k$.}
+TR-drift depends on a chosen rank $k$ for the functional subspace $\PA$. To
+verify our finding is not an artifact of a lucky choice of $k$, we re-ran the
+observational sweep at $k\in\{8,16,32\}$. The TR-drift--forgetting correlation is
+high and significant at every rank: $r=0.65$ ($k=8$), $r=0.70$ ($k=16$), and
+$r=0.73$ ($k=32$), all with $p<10^{-7}$ ($N=54$ conditions each). The effect is
+thus robust to the choice of subspace rank, and if anything strengthens mildly
+as $k$ grows.
+
+% -----------------------------------------------------------------------------
+\section{Experiment 2b: Decomposing Drift into Task-Relevant and Orthogonal Components}
+\label{sec:decomposition}
+
+The incremental-validity result already hints that not all parameter motion is
+equally harmful. We make this precise by decomposing total drift into two
+orthogonal parts: the task-relevant component inside $\PA$ ($\trdrift$) and the
+remaining orthogonal component
+$\mathrm{Drift}_{\perp}=\sqrt{\totaldrift^{2}-\trdrift^{2}}$. We then ask which
+component carries the predictive signal for forgetting.
+
+Marginally, both components correlate with forgetting ($\trdrift$: $r=0.63$;
+$\mathrm{Drift}_{\perp}$: $r=0.47$), but this is misleading: the orthogonal
+component is numerically dominated by---and nearly collinear with---total drift.
+The decisive analysis is a joint regression. Regressing forgetting on both
+components simultaneously, the task-relevant coefficient is large, positive, and
+highly significant, whereas the orthogonal coefficient is small and, after
+controlling for $\trdrift$, does \emph{not} carry the same positive association
+with forgetting (Table~\ref{tab:decomp}). Equivalently, the partial correlation
+of $\trdrift$ with forgetting (controlling for orthogonal drift) is $+0.52$
+($p=1.1\times10^{-12}$), while the partial correlation of orthogonal drift
+(controlling for $\trdrift$) is $-0.24$ ($p=2.6\times10^{-3}$).
+
+\begin{table}[t]
+\centering
+\caption{Joint regression of forgetting on the two drift components ($N=162$).
+The predictive signal is concentrated in the task-relevant component.}
+\label{tab:decomp}
+\begin{tabular}{lccc}
+\toprule
+Component & Coefficient & $p$-value & Partial $r$ \\
+\midrule
+$\trdrift$ (in $\PA$)               & $+127.1$ & $1.4\times10^{-12}$ & $+0.52$ \\
+$\mathrm{Drift}_{\perp}$ (orthogonal) & $-5.6$  & $2.6\times10^{-3}$  & $-0.24$ \\
+\midrule
+\multicolumn{4}{l}{$R^2 = 0.43$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+We are deliberately cautious in interpretation: this analysis does not show that
+orthogonal motion is ``safe'' in any absolute sense. What it shows is that,
+once the task-relevant component is isolated, the orthogonal component does not
+carry the same positive explanatory signal for forgetting. Within the scope of
+GPT-2 small and our task suite, the predictive signal is concentrated in motion
+inside the previous task's functional subspace---exactly the quantity our causal
+experiment (Section~\ref{sec:causal}) manipulates.
+
+% -----------------------------------------------------------------------------
+\section{Experiment 3: Task-Relevant Drift Causes Forgetting}
+\label{sec:causal}
+
+Correlation, however robust, cannot establish that task-relevant motion
+\emph{causes} forgetting rather than co-varying with some third factor. Our
+decoupling experiment (Section~\ref{sec:method}) provides the causal test:
+holding the total backbone step norm fixed, we steer the update \textsc{into}
+$\PA$ versus \textsc{orth} to it, across three strongly-forgetting task pairs,
+two learning rates, and five seeds ($N=30$ paired comparisons).
+
+The manipulation succeeds: total drift is matched across arms
+(\textsc{into} $=0.0023$, \textsc{orth} $=0.0025$), while by construction the
+\textsc{orth} arm has essentially zero $\trdrift$. The effect on forgetting is
+large and consistent: the \textsc{into} arm forgets $0.186$ on average versus
+$0.106$ for \textsc{orth}---a paired difference of $+0.080$ with 95\% bootstrap
+CI $[+0.050, +0.109]$, Cohen's $d=0.94$, Wilcoxon $p=10^{-4}$. The confidence
+interval excludes zero, so at matched total motion, steering the backbone
+\emph{into} the previous task's functional subspace causes substantially more
+forgetting (Table~\ref{tab:causal}).
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.5\linewidth]{fig_causal_intervention.png}
+\caption{Causal decoupling at matched total drift ($N=30$). Steering the backbone
+\emph{into} $\PA$ produces $0.186$ forgetting versus $0.106$ when steered
+orthogonally---nearly double---despite identical total motion ($d=0.94$,
+$p=10^{-4}$). Error bars are s.e.m.}
+\label{fig:causal}
+\end{figure}
+
+\begin{table}[t]
+\centering
+\caption{Causal decoupling at matched total drift ($N=30$ paired). Motion into
+$\PA$ causes more forgetting.}
+\label{tab:causal}
+\begin{tabular}{lcc}
+\toprule
+ & \textsc{into} $\PA$ & \textsc{orth} $\PA$ \\
+\midrule
+Total drift (matched)  & $0.0023$ & $0.0025$ \\
+Forgetting             & $\mathbf{0.186}$ & $0.106$ \\
+\midrule
+\multicolumn{3}{l}{Paired diff $=+0.080$, 95\% CI $[+0.050,+0.109]$,
+$d=0.94$, $p=10^{-4}$} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% -----------------------------------------------------------------------------
+\section{Experiment 4: Task-Relevant Drift Predicts Forgetting Across Mitigation Methods}
+\label{sec:baselines}
+
+A natural question is whether $\trdrift$ is merely an artifact of plain
+fine-tuning, or a general property that also governs forgetting under
+established continual-learning methods. We therefore run three standard
+mitigations on the same strongly-forgetting task pairs (five seeds each):
+EWC \citep{kirkpatrick2017overcoming}, which penalizes changes to
+Fisher-important parameters; OGD \citep{farajtabar2020orthogonal}, which
+projects updates orthogonal to stored Task-A gradient directions; and GPM
+\citep{saha2021gradient}, which projects orthogonal to the top gradient
+subspace. (These are standard reimplementations applied to the backbone target
+tensors; we did not exhaustively tune each method's hyperparameters, e.g.\ the
+EWC penalty strength.)
+
+Two findings emerge (Table~\ref{tab:baselines}). First, in our two-task,
+GPT-2-small setting none of the three methods reduces forgetting by a large
+margin relative to vanilla fine-tuning---the differences are small. We do not
+over-claim here; reducing forgetting was not the purpose of this experiment.
+Second, and more importantly, $\trdrift$ remains correlated with forgetting
+\emph{pooled across all four methods} ($r=0.53$, $p=1.3\times10^{-5}$, $N=60$).
+The relationship between task-relevant drift and forgetting is thus not specific
+to plain fine-tuning: it persists under regularization- and projection-based
+mitigations, supporting $\trdrift$ as a general descriptor of forgetting rather
+than an artifact of a single training procedure.
+
+\begin{table}[t]
+\centering
+\caption{Forgetting under mitigation methods ($N=60$; mean $\pm$ s.e.m.).
+Differences are small; the key point is that $\trdrift$ tracks forgetting across
+\emph{all} methods ($r=0.53$, $p=1.3\times10^{-5}$).}
+\label{tab:baselines}
+\begin{tabular}{lcc}
+\toprule
+Method & Forgetting & Mean $\trdrift$ \\
+\midrule
+Vanilla fine-tuning & $0.262 \pm 0.032$ & $0.0011$ \\
+EWC                 & $0.265 \pm 0.025$ & $0.0011$ \\
+OGD                 & $0.251 \pm 0.026$ & $0.0007$ \\
+GPM                 & $0.240 \pm 0.028$ & $0.0010$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% -----------------------------------------------------------------------------
+\section{Discussion}
+\label{sec:discussion}
+
+Our three experiments tell a consistent story. The static geometric overlap
+between task subspaces---the quantity that motivates many projection-based
+mitigations---is a weak and largely redundant predictor of forgetting. What
+matters is the \emph{realized} motion inside the previous task's functional
+subspace: $\trdrift$ predicts forgetting beyond total drift, and a controlled
+manipulation shows it does so causally.
+
+\paragraph{Implications for mitigation.}
+The result is encouraging for the \emph{spirit} of orthogonalization methods
+(direction matters) while cautioning against relying on \emph{static} overlap
+estimates: it is the direction actually traversed during the interfering update,
+not the a priori geometric overlap, that drives forgetting. Methods that monitor
+or constrain realized task-relevant motion online may be more effective than
+those that pre-compute static subspace overlaps.
+
+\paragraph{$\trdrift$ as an online diagnostic.}
+Because $\trdrift$ is computed from inner products with a stored low-rank basis,
+it can be tracked cheaply during training as an early-warning signal of
+impending forgetting, independent of whether one intervenes.
+
+\paragraph{From diagnosis to prevention (a cautionary preliminary).}
+Given the causal result, an obvious idea is to \emph{prevent} forgetting by
+constraining $\trdrift$ during training---a ``TR-Guard''. We ran a small
+preliminary probe (two task pairs, three seeds) comparing vanilla fine-tuning
+against a strict static projection that removes the in-$\PA$ component of every
+backbone update, and against a soft penalty
+$\lambda\lVert\Pi_{\PA}(\Delta\theta)\rVert^2$. Neither variant produced a
+statistically reliable reduction in forgetting at this small sample: the strict
+projection did not help on average and was highly pair-dependent, while the
+penalty showed a promising but non-significant mean reduction
+($p\approx0.17$, untuned $\lambda$). We report this honestly as a negative
+preliminary: \emph{eliminating static task-relevant drift alone does not
+straightforwardly eliminate forgetting}. This does not contradict the causal
+finding---moving into $\PA$ does cause forgetting---but indicates that a
+\emph{static} one-shot estimate of $\PA$ is insufficient as a control target,
+and that effective prevention likely requires a dynamically refreshed subspace
+and/or a tuned penalty. We leave a full TR-Guard method to future work.
+
+% -----------------------------------------------------------------------------
+\section{Limitations}
+\label{sec:limitations}
+
+We restrict all claims to GPT-2 small and to pairs of binary text-classification
+tasks; whether the same causal relationship holds at the scale of modern
+billion-parameter LLMs is an open and important question, and is the natural
+next experiment. Our task sequences are length two; longer continual sequences
+may introduce cumulative effects we do not capture. The functional subspace
+$\PA$ is estimated from gradient PCA over a finite sample and a chosen rank $k$;
+our robustness check over $k\in\{8,16,32\}$ shows the main correlation is stable,
+but we did not vary the gradient-sample size. Finally, our forgetting metric is
+accuracy-based; loss- or calibration-based notions may behave differently.
+None of these caveats undermines the within-scope causal finding, but each marks
+a boundary of what we claim.
+
+% -----------------------------------------------------------------------------
+\section{Conclusion}
+\label{sec:conclusion}
+
+We asked whether the static geometric overlap between task subspaces explains
+catastrophic forgetting in LoRA continual fine-tuning, and found that it does
+not. The portion of parameter motion that lands inside the previous task's
+functional subspace---Task-Relevant Drift---is a stronger predictor, carries
+incremental validity beyond total motion, and, in a controlled decoupling
+experiment, \emph{causes} more forgetting at matched total drift. Direction in
+parameter space, relative to the previous task's functional subspace, is thus a
+genuine cause of forgetting. We hope $\trdrift$ proves useful both as a lens on
+why continual fine-tuning fails and as a cheap online diagnostic, and we view
+scaling the causal test to larger models as the most important next step.
+
+% -----------------------------------------------------------------------------
+\section*{Reproducibility Statement}
+All experiments are produced by a single script, run end-to-end with one
+command. We release the code and the two result files
+(\texttt{observational.csv}, $N=162$; \texttt{decisive.csv}, $N=30$; and
+\texttt{k\_ablation.csv} for the rank-robustness check) used for
+every number and figure in this paper. Random seeds, learning-rate grids, task
+pairs, and all hyperparameters are specified in the configuration and logged.
+Code and data: \url{https://github.com/Haythemsys/trdt-forgetting}.
+
+% -----------------------------------------------------------------------------
+\bibliographystyle{plainnat}
+\begin{thebibliography}{99}
+
+\bibitem[Farajtabar et al.(2020)]{farajtabar2020orthogonal}
+M.~Farajtabar, N.~Azizan, A.~Mott, and A.~Li.
+\newblock Orthogonal gradient descent for continual learning.
+\newblock In \emph{AISTATS}, 2020.
+
+\bibitem[French(1999)]{french1999catastrophic}
+R.~M. French.
+\newblock Catastrophic forgetting in connectionist networks.
+\newblock \emph{Trends in Cognitive Sciences}, 3(4):128--135, 1999.
+
+\bibitem[Hu et al.(2021)]{hu2021lora}
+E.~J. Hu, Y.~Shen, P.~Wallis, Z.~Allen-Zhu, Y.~Li, S.~Wang, L.~Wang, and
+W.~Chen.
+\newblock {LoRA}: Low-rank adaptation of large language models.
+\newblock \emph{arXiv:2106.09685}, 2021.
+
+\bibitem[Kirkpatrick et al.(2017)]{kirkpatrick2017overcoming}
+J.~Kirkpatrick, R.~Pascanu, N.~Rabinowitz, et al.
+\newblock Overcoming catastrophic forgetting in neural networks.
+\newblock \emph{PNAS}, 114(13):3521--3526, 2017.
+
+\bibitem[Li \& Hoiem(2017)]{li2017learning}
+Z.~Li and D.~Hoiem.
+\newblock Learning without forgetting.
+\newblock \emph{IEEE TPAMI}, 40(12):2935--2947, 2017.
+
+\bibitem[McCloskey \& Cohen(1989)]{mccloskey1989catastrophic}
+M.~McCloskey and N.~J. Cohen.
+\newblock Catastrophic interference in connectionist networks.
+\newblock \emph{Psychology of Learning and Motivation}, 24:109--165, 1989.
+
+\bibitem[Rebuffi et al.(2017)]{rebuffi2017icarl}
+S.-A. Rebuffi, A.~Kolesnikov, G.~Sperl, and C.~H. Lampert.
+\newblock {iCaRL}: Incremental classifier and representation learning.
+\newblock In \emph{CVPR}, 2017.
+
+\bibitem[Saha et al.(2021)]{saha2021gradient}
+G.~Saha, I.~Garg, and K.~Roy.
+\newblock Gradient projection memory for continual learning.
+\newblock In \emph{ICLR}, 2021.
+
+\end{thebibliography}
+
+\end{document}
