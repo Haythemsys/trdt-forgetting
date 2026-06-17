@@ -943,13 +943,75 @@ def analyze_baselines(cfg, df=None):
 
 
 # -----------------------------------------------------------------------------
+# k-ABLATION: is the TR-drift <-> forgetting relationship robust to the choice
+#   of subspace rank k? We re-run a reduced observational sweep at k in {8,16,32}
+#   and report r(TR-drift, forgetting) for each. Robustness here pre-empts the
+#   obvious reviewer question "did you just pick a lucky k?".
+# -----------------------------------------------------------------------------
+KABLATION_KS = (8, 16, 32)
+KABLATION_PAIRS = (("ag_news", "imdb"), ("sst2", "ag_news"), ("yelp", "ag_news"))
+KABLATION_SEEDS = (0, 1, 2)
+
+
+def run_k_ablation(cfg, ks=KABLATION_KS, pairs=KABLATION_PAIRS, seeds=KABLATION_SEEDS):
+    import torch, pandas as pd
+    from scipy.stats import pearsonr
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    rows = []
+    out_path = os.path.join(cfg.out_dir, "k_ablation.csv")
+    done = set()
+    if os.path.exists(out_path):
+        prev = pd.read_csv(out_path); rows = prev.to_dict("records")
+        done = set((r["k"], r["taskA"], r["taskB"], r["seed"], r["lr"]) for r in rows)
+        print(f"[resume] {len(done)} rows already done")
+    for k in ks:
+        cfg.subspace_k = k
+        for (A, B) in pairs:
+            for seed in seeds:
+                set_seed(seed); model, tok = build_model(cfg, device)
+                aTr, aTrL, aTe, aTeL = make_split(A, cfg, seed)
+                bTr, bTrL, _, _ = make_split(B, cfg, seed)
+                dA = tokenize(tok, aTr, aTrL, cfg, device); dAt = tokenize(tok, aTe, aTeL, cfg, device)
+                dB = tokenize(tok, bTr, bTrL, cfg, device)
+                train_task(model, dA, cfg, lr=cfg.lora_lr, seed=seed, label="A")
+                accA = eval_acc(model, dAt, cfg)
+                sub = compute_subspace(model, dA, cfg, seed)
+                before = snapshot_target(model, cfg)
+                postA = {kk: v.detach().clone() for kk, v in model.state_dict().items()}
+                for lr in cfg.learning_rates:
+                    if (k, A, B, seed, lr) in done:
+                        continue
+                    model.load_state_dict(postA)
+                    train_task(model, dB, cfg, lr=lr, seed=seed, label="B")
+                    accB = eval_acc(model, dAt, cfg)
+                    dm = drift_measures(before, snapshot_target(model, cfg), sub)
+                    rows.append({"k": k, "taskA": A, "taskB": B, "seed": seed, "lr": lr,
+                                 "forgetting": max(0.0, accA - accB), **dm})
+                    print(f"[kabl] k={k} {A[:4]}->{B[:4]} s={seed} lr={lr:.0e} "
+                          f"forget={rows[-1]['forgetting']:.3f} tr={dm['tr_drift']:.4f}", flush=True)
+                pd.DataFrame(rows).to_csv(out_path, index=False)
+                del model; gc.collect()
+                if device == "cuda": torch.cuda.empty_cache()
+    df = pd.DataFrame(rows)
+    df.to_csv(out_path, index=False)
+    print("\n" + "=" * 50 + "\nk-ABLATION: r(TR-drift, forgetting) by rank k\n" + "=" * 50)
+    for k in ks:
+        sub_df = df[df["k"] == k]
+        if len(sub_df) > 2:
+            r, p = pearsonr(sub_df["tr_drift"], sub_df["forgetting"])
+            print(f"  k={k:2d}:  r = {r:+.3f}  p = {p:.2e}  (N={len(sub_df)})")
+    print("\n>>> if r stays high across k, the effect is robust to subspace rank.")
+    return df
+
+
+# -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description="TRDT N=3 fix (Kaggle-ready)")
     ap.add_argument("--smoke", action="store_true", help="tiny fast run to verify the pipeline")
     ap.add_argument("--full", action="store_true", help="full experiment")
-    ap.add_argument("--stage", choices=["obs", "intervene", "analyze", "decisive", "paper", "baselines", "all"], default="all")
+    ap.add_argument("--stage", choices=["obs", "intervene", "analyze", "decisive", "paper", "baselines", "kablation", "all"], default="all")
     ap.add_argument("--out", default=None)
     args, _ = ap.parse_known_args()  # ignore notebook/kernel args (Colab/Jupyter safe)
 
@@ -958,7 +1020,7 @@ def main():
         cfg.out_dir = args.out
     elif not os.path.isdir("/kaggle/working"):
         cfg.out_dir = "/content" if os.path.isdir("/content") else "."
-    if args.smoke or (not args.full and args.stage not in ("decisive", "paper", "baselines")):
+    if args.smoke or (not args.full and args.stage not in ("decisive", "paper", "baselines", "kablation")):
         cfg = apply_smoke(cfg)
         print(">> SMOKE MODE (tiny). Use --full for the real run.\n")
     os.makedirs(cfg.out_dir, exist_ok=True)
@@ -980,6 +1042,8 @@ def main():
     if args.stage == "baselines":
         df = run_baselines(cfg)
         analyze_baselines(cfg, df)
+    if args.stage == "kablation":
+        run_k_ablation(cfg)
     if args.stage == "paper":
         # ONE command -> every result in the paper, all saved to CSV, reproducible.
         print("\n##### STAGE 1/3 : observational sweep + static-overlap negative result #####\n")
